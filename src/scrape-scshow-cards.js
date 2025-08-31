@@ -1,19 +1,18 @@
 // src/scrape-scshow-cards.js
 // ESM対応（package.json に "type":"module" を想定）
-// 目的: https://asmape0104.github.io/scshow-calculator/ からカード一覧を堅牢に抽出し、cards.csv を出力
+// 目的: https://asmape0104.github.io/scshow-calculator/ からカード候補を堅牢に抽出し、cards.csv を出力
 // 特徴:
-//  - Playwright (CLIでブラウザ＋依存を導入済み前提)
-//  - UIの遅延/モーダル非表示に強いリトライ＆“任意モーダル”扱い
-//  - 複数のDOM構造（table, li, role=option, button/a群）に対応したフォールバック抽出
-//  - 何も取れなくてもヘッダーのみの CSV を出力（ワークフローを安定させる）
+//  - Playwright（CLIでブラウザ＋依存を導入済み前提）
+//  - UI遅延やモーダル非表示に強い“任意モーダル”扱い＆フォールバック抽出
+//  - 何も取れなくてもヘッダーのみ CSV を出力してワークフローを安定化
 //
 // 実行: `node src/scrape-scshow-cards.js`
-// 環境変数:
-//   BASE_URL   : 既定 'https://asmape0104.github.io/scshow-calculator/'
-//   OUT_FILE   : 既定 'cards.csv'
-//   HEADLESS   : 'true'|'false' 既定 'true'
-//   TIMEOUT_MS : 既定 '30000' (各操作のデフォルト)
-//   NAV_TIMEOUT_MS : 既定 '60000' (ナビゲーション)
+// 環境変数（任意）:
+//   BASE_URL        : 既定 'https://asmape0104.github.io/scshow-calculator/'
+//   OUT_FILE        : 既定 'cards.csv'
+//   HEADLESS        : 'true'|'false' 既定 'true'
+//   TIMEOUT_MS      : 既定 30000  （操作デフォルト）
+//   NAV_TIMEOUT_MS  : 既定 60000  （ナビゲーション）
 
 import { chromium } from 'playwright';
 import fs from 'node:fs/promises';
@@ -56,42 +55,56 @@ async function writeCsv(filePath, rows, headers) {
   await fs.writeFile(filePath, lines.join('\n'), 'utf8');
 }
 
-// ------------------------- DOM抽出（ブラウザ内） -------------------------
-/**
- * ダイアログ/モーダル内、もしくはページ全体からカード候補を抽出
- * 多様な構造に対応するため複数の手法で網羅的に拾う
- */
+// ------------------------- 正規化 -------------------------
+function dedupeAndNormalize(items) {
+  function clean(s) {
+    if (s == null) return '';
+    return String(s).replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  const out = [];
+  const seen = new Set();
+
+  for (const it of items || []) {
+    const rec = {
+      id: clean(it.id),
+      name: clean(it.name),
+      extra: clean(it.extra),
+      source: clean(it.source || 'unknown'),
+    };
+    const key = rec.name || rec.id;
+    if (!key) continue;
+    const k = key.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(rec);
+  }
+
+  out.sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+  return out;
+}
+
+// ------------------------- DOM抽出（ブラウザ内評価） -------------------------
 async function extractCards(page) {
-  // 可能ならモーダル/ダイアログを優先的に探索
   const modalSel = '[role="dialog"], .modal, .modal-dialog, .MuiDialog-root, .ant-modal-root';
   const modal = page.locator(modalSel).first();
   const hasModal = await waitForOptionalVisible(modal, 2000);
 
-  // 抽出ロジック（共通）
   async function scrapeRoot(rootHandle) {
     return await rootHandle.evaluate((root) => {
       const uniq = new Map();
 
-      const norm = (s) =>
-        (s || '')
-          .replace(/\u00A0/g, ' ')
-          .replace(/\s+/g, ' ')
-          .trim();
-
+      const norm = (s) => (s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
       const push = (obj) => {
-        // name をキーとして重複排除（なければ raw）
-        const key = obj.name || obj.raw || obj.id || JSON.stringify(obj);
-        const k = norm(key);
-        if (k && !uniq.has(k)) uniq.set(k, obj);
+        const key = norm(obj.name || obj.raw || obj.id || '');
+        if (key && !uniq.has(key)) uniq.set(key, obj);
       };
 
       // 1) table 形式
-      const tables = root.querySelectorAll('table');
-      tables.forEach((tbl) => {
-        const rows = tbl.querySelectorAll('tbody tr');
-        rows.forEach((tr) => {
+      root.querySelectorAll('table').forEach((tbl) => {
+        tbl.querySelectorAll('tbody tr').forEach((tr) => {
           const cells = Array.from(tr.querySelectorAll('th,td')).map((td) => norm(td.innerText));
-          if (cells.length > 0) {
+          if (cells.length) {
             const [name, ...rest] = cells;
             if (name) {
               push({
@@ -106,92 +119,89 @@ async function extractCards(page) {
         });
       });
 
-      // 2) list item 形式（role=option, li, 各種 UI ライブラリ）
-      const listItems = root.querySelectorAll(
-        '[role="option"], li, .list-group-item, .MuiMenuItem-root, .MuiListItem-root, .ant-select-item'
-      );
-      listItems.forEach((li) => {
-        const txt = norm(li.innerText);
-        if (txt) {
-          push({
-            id:
-              li.getAttribute('data-card-id') ||
-              li.getAttribute('data-id') ||
-              li.getAttribute('data-key') ||
-              '',
-            name: txt,
-            extra: '',
-            source: 'list',
-            raw: txt,
-          });
-        }
-      });
-
-      // 3) ボタン/アンカー集合（カード名をボタン/リンクで並べるタイプ）
-      const btns = root.querySelectorAll('button, a');
-      btns.forEach((el) => {
-        const txt = norm(el.innerText || el.getAttribute('aria-label'));
-        if (txt) {
-          const cls = el.className || '';
-          // “選択して入力”など操作ボタンは除外っぽいヒューリスティック
-          if (!/選択して入力|検索|閉じる|OK|キャンセル/i.test(txt)) {
+      // 2) list item / role=option 系
+      root
+        .querySelectorAll(
+          '[role="option"], li, .list-group-item, .MuiMenuItem-root, .MuiListItem-root, .ant-select-item'
+        )
+        .forEach((li) => {
+          const txt = norm(li.innerText);
+          if (txt) {
             push({
               id:
-                el.getAttribute('data-card-id') ||
-                el.getAttribute('data-id') ||
-                el.getAttribute('href') ||
+                li.getAttribute('data-card-id') ||
+                li.getAttribute('data-id') ||
+                li.getAttribute('data-key') ||
                 '',
               name: txt,
-              extra: cls ? `class:${cls}` : '',
-              source: 'buttons',
+              extra: '',
+              source: 'list',
               raw: txt,
             });
           }
-        }
+        });
+
+      // 3) ボタン/リンクの集合
+      root.querySelectorAll('button, a').forEach((el) => {
+        const txt = norm(el.innerText || el.getAttribute('aria-label'));
+        if (!txt) return;
+        if (/選択して入力|検索|閉じる|OK|キャンセル/i.test(txt)) return; // 操作ボタンは除外
+        push({
+          id:
+            el.getAttribute('data-card-id') ||
+            el.getAttribute('data-id') ||
+            el.getAttribute('href') ||
+            '',
+          name: txt,
+          extra: el.className ? `class:${el.className}` : '',
+          source: 'buttons',
+          raw: txt,
+        });
       });
 
       // 4) select/option 形式
-      const selects = root.querySelectorAll('select');
-      selects.forEach((sel) => {
-        sel.querySelectorAll('option').forEach((op) => {
-          const txt = norm(op.textContent || '');
-          const val = norm(op.value || '');
-          if (txt || val) {
-            push({
-              id: val || '',
-              name: txt || val,
-              extra: '',
-              source: 'select',
-              raw: txt || val,
-            });
-          }
-        });
+      root.querySelectorAll('select option').forEach((op) => {
+        const txt = norm(op.textContent || '');
+        const val = norm(op.value || '');
+        if (txt || val) {
+          push({
+            id: val || '',
+            name: txt || val,
+            extra: '',
+            source: 'select',
+            raw: txt || val,
+          });
+        }
       });
 
       return Array.from(uniq.values());
     });
   }
 
-  // モーダルがあればモーダル優先で抽出
+  // モーダル優先
   if (hasModal) {
     try {
       const handle = await modal.elementHandle();
       if (handle) {
         const fromModal = await scrapeRoot(handle);
-        if (fromModal?.length) return fromModal;
+        if (fromModal && fromModal.length) return fromModal;
       }
     } catch {
       // ignore
     }
   }
 
-  // フォールバック: ページ全体から抽出
+  // フォールバック: ページ全体
   const doc = await page.evaluateHandle(() => document.documentElement);
-  const fromPage = await scrapeRoot(doc);
-  return fromPage ?? [];
+  try {
+    const fromPage = await scrapeRoot(doc);
+    return fromPage || [];
+  } finally {
+    await doc.dispose();
+  }
 }
 
-// ------------------------- メイン -------------------------
+// ------------------------- メイン処理 -------------------------
 async function main() {
   console.log('[INFO] Launching browser...');
   const browser = await chromium.launch({ headless: HEADLESS });
@@ -208,41 +218,42 @@ async function main() {
     await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
 
-    // 「カードを選択して入力」ボタンを押す（あれば）
+    // 「カードを選択して入力」ボタンがあればクリック
     const chooseBtn = page.getByRole('button', { name: /カードを選択して入力/ });
-    const hasChooseBtn = await waitForOptionalVisible(chooseBtn, 3000);
-    if (hasChooseBtn) {
+    if (await waitForOptionalVisible(chooseBtn, 3000)) {
       console.log('[INFO] Clicking 「カードを選択して入力」...');
       await chooseBtn.click({ timeout: 10_000 }).catch(() => {});
     } else {
-      console.log('[WARN] 「カードを選択して入力」ボタンが見つからず。ページ全体から抽出を試みます。');
+      console.log('[WARN] 「カードを選択して入力」ボタンが見つからず。ページ全体から抽出します。');
     }
 
-    // 任意モーダル扱い：出たら閉じる前に中身を抽出、出なければそのまま抽出
+    // 任意モーダル検出（出れば抽出を優先）
     const modalSel = '[role="dialog"], .modal, .modal-dialog, .MuiDialog-root, .ant-modal-root';
     const modal = page.locator(modalSel).first();
     const appeared = await waitForOptionalVisible(modal, 3000);
     if (appeared) {
-      console.log('[INFO] モーダルを検出。内容を抽出します。');
+      console.log('[INFO] モーダルを検出。内容を優先的に抽出します。');
     } else {
       console.log('[INFO] モーダルは表示されていません。ページから直接抽出します。');
     }
 
-    // カード抽出（モーダル優先 → ページ）
+    // 抽出
     const items = await extractCards(page);
 
-    // モーダルが出ていた場合は閉じる試行（次操作の邪魔にならないように）
+    // モーダルが出ていた場合は閉じる（後続の邪魔をしないよう）
     if (appeared) {
-      const close = modal.locator(
-        'button:has-text("OK"), button:has-text("閉じる"), [aria-label="Close"], .close, .modal-close, [data-test="close"]'
-      ).first();
+      const close = modal
+        .locator(
+          'button:has-text("OK"), button:has-text("閉じる"), [aria-label="Close"], .close, .modal-close, [data-test="close"]'
+        )
+        .first();
       if (await close.isVisible().catch(() => false)) {
         await close.click({ timeout: 5000 }).catch(() => {});
         await modal.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
       }
     }
 
-    // 抽出後の整形＆CSV出力
+    // CSV 出力
     const cleaned = dedupeAndNormalize(items);
     const headers = ['id', 'name', 'extra', 'source'];
     if (!cleaned.length) {
@@ -258,45 +269,18 @@ async function main() {
   }
 }
 
-/** 二重化・余白掃除・最低限の正規化 */
-function dedupeAndNormalize(items) {
-  const out = [];
-  const seen = new Set();
-  for (const it of items || []) {
-    const rec = {
-      id: clean(it.id),
-      name: clean(it.name),
-      extra: clean(it.extra),
-      source: clean(it.source || 'unknown'),
-    };
-    // name が主キー。なければ raw/id で代替
-    const key = rec.name || rec.id;
-    if (!key) continue;
-    const k = key.toLowerCase();
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(rec);
-  }
-  // 名前順で安定化
-  out.sort((a, b) => (a.name > b.name ? 1 : a.name < b.name ? -1 : 0));
-  return out;
-
-  function clean(s) {
-    if (s == null) return '';
-    return String(s).replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
-  }
-}
-
-// ------------------------- 実行 -------------------------
+// ------------------------- 起動 -------------------------
 main()
   .then(() => {
-    // 取得0件でも成功終了（ワークフロー安定化）。件数はログで判断。
+    // 取得0件でも成功終了（件数はログで判断）
     process.exit(0);
   })
-  .catch((e) => {
+  .catch(async (e) => {
     console.error('[ERROR]', e?.stack || e);
-    // 失敗時でも CSV が無いとワークフロー後段で失敗するため、ヘッダのみ出力してから異常終了
+    // 異常時でも後続が動けるようヘッダーのみ出力してから失敗終了
     const headers = ['id', 'name', 'extra', 'source'];
-    fs.writeFile(OUT_FILE, `${headers.join(',')}\n`, 'utf8')
-      .catch(() => {})
-      .finally(() => process.exit(1));
+    try {
+      await fs.writeFile(OUT_FILE, `${headers.join(',')}\n`, 'utf8');
+    } catch {}
+    process.exit(1);
+  });
