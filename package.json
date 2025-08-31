@@ -1,0 +1,12 @@
+{
+  "name": "scshow-scraper",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "scrape": "node src/scrape-scshow-cards.js"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.47.2",
+    "fast-csv": "^5.0.1"
+  }
+}
