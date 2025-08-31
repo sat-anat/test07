@@ -32,7 +32,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-        # 内蔵cacheは使わず、下の actions/cache に統一
+        # 内蔵cacheは使わず、明示的な actions/cache に統一
 
       # --- ロックファイルの有無を検出 ---
       - name: Detect lockfile
@@ -78,7 +78,7 @@ jobs:
           path: |
             ~/.cache/ms-playwright
             ~/.cache/playwright
-          key: pw-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('**/package-lock.json', '**/package.json') }}-${{ env.CACHE_VERSION }}
+          key: pw-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('package-lock.json', 'package.json') }}-${{ env.CACHE_VERSION }}
           restore-keys: |
             pw-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-
             pw-${{ runner.os }}-
@@ -100,9 +100,9 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Cache hits"
-          echo "npm cache (lock) hit: ${{ steps.cache_npm_lock.outputs['cache-hit'] }}"
-          echo "npm cache (pkg)  hit: ${{ steps.cache_npm_pkg .outputs['cache-hit'] }}"
-          echo "playwright cache  hit: ${{ steps.cache_pw.outputs['cache-hit'] }}"
+          echo "npm cache (lock) hit: ${{ steps.cache_npm_lock.outputs.cache-hit }}"
+          echo "npm cache (pkg)  hit: ${{ steps.cache_npm_pkg.outputs.cache-hit }}"
+          echo "playwright cache  hit: ${{ steps.cache_pw.outputs.cache-hit }}"
           echo "::endgroup::"
 
           echo "::group::Existing cache directories (before install)"
@@ -141,13 +141,15 @@ jobs:
 
       # --- Playwright ブラウザ＋システム依存を CLI で導入（Ubuntu 24.04 対応） ---
       # 公式推奨: GitHub Actionではなく CLI を使用（`npx playwright install --with-deps`）
-      # 古い Playwright 依存のために失敗する環境では CLI を一時的に v1.51.1 にピン留め
+      # 古い Playwright 依存の環境向けに、一時的に v1.51.1 の CLI にフォールバック
       - name: Install Playwright browsers & system deps (CLI)
         shell: bash
         run: |
           set -euxo pipefail
+
           echo "::group::Detect Playwright version"
-          PV="$(node -p \"(() => { try { return require('@playwright/test/package.json').version } catch(e) { return '' } })()\")"
+          # 括弧や矢印関数を使わずに安全に検出
+          PV="$(node -e "try{process.stdout.write(require('@playwright/test/package.json').version)}catch(e){process.stdout.write('')}" || true)"
           echo "Detected @playwright/test version: ${PV:-'(not installed)'}"
           echo "::endgroup::"
 
@@ -219,3 +221,4 @@ jobs:
         with:
           name: scshow-cards-csv
           path: cards.csv
+          if-no-files-found: error
