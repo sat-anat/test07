@@ -19,26 +19,23 @@ jobs:
       - name: Checkout self
         uses: actions/checkout@v4
 
-      # --- 重要: キャッシュ対象ディレクトリを先に作成しておく ---
+      # --- キャッシュ対象ディレクトリを先に作成（未作成エラー回避） ---
       - name: Prepare cache directories
         shell: bash
         run: |
           set -eux
           mkdir -p "${NPM_CACHE_DIR}"
           mkdir -p ~/.cache/ms-playwright ~/.cache/playwright
-          echo "Prepared:"
-          du -sh "${NPM_CACHE_DIR}" || true
-          du -sh ~/.cache/ms-playwright || true
-          du -sh ~/.cache/playwright || true
+          echo "Prepared cache dirs."
 
       - name: Setup Node
         id: node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-        # 内蔵キャッシュはトラブル回避のため使用しない（明示cacheステップに統一）
+        # 内蔵cacheは使わず、下の actions/cache に統一
 
-      # npm のダウンロードキャッシュ（手動バスティング可能）
+      # --- npm ダウンロードキャッシュ ---
       - name: Cache npm download dir
         id: cache_npm
         uses: actions/cache@v4
@@ -49,7 +46,7 @@ jobs:
             npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-
             npm-${{ runner.os }}-
 
-      # Playwright ブラウザ資材のキャッシュ
+      # --- Playwright ブラウザ資材キャッシュ ---
       - name: Cache Playwright browsers
         id: cache_pw
         uses: actions/cache@v4
@@ -62,7 +59,7 @@ jobs:
             pw-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-
             pw-${{ runner.os }}-
 
-      # 主要な環境情報・キャッシュ状況の出力（デバッグ）
+      # --- 事前デバッグ情報 ---
       - name: Debug | System & Cache status (pre-install)
         shell: bash
         run: |
@@ -79,8 +76,8 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Cache hits"
-          echo "npm cache hit: ${{ steps.cache_npm.outputs.cache-hit }}"
-          echo "playwright cache hit: ${{ steps.cache_pw.outputs.cache-hit }}"
+          echo "npm cache hit: ${{ steps.cache_npm.outputs['cache-hit'] }}"
+          echo "playwright cache hit: ${{ steps.cache_pw.outputs['cache-hit'] }}"
           echo "::endgroup::"
 
           echo "::group::Existing cache directories (before install)"
@@ -91,13 +88,9 @@ jobs:
           done
           echo "::endgroup::"
 
-      # Playwright の依存インストール（OSパッケージ等も含む）
-      - name: Install Playwright Browsers
-        uses: microsoft/playwright-github-action@v1
-
+      # --- 依存インストール（ダウンロードはキャッシュ再利用） ---
       - name: Install deps (npm ci)
         env:
-          # npm の詳細ログを最大化
           npm_config_loglevel: silly
           NODE_OPTIONS: "--trace-deprecation"
         shell: bash
@@ -114,6 +107,30 @@ jobs:
           npm ci --prefer-offline --no-audit --fund=false --verbose
           echo "::endgroup::"
 
+      # --- Playwright ブラウザ＋システム依存を CLI で導入（Ubuntu 24.04 対応） ---
+      #  - プロジェクトに入っている @playwright/test のバージョンを確認
+      #  - 1.51.1 以上ならそのまま `npx playwright install --with-deps`
+      #  - 古い場合は CLI だけ 1.51.1 を一時使用してインストール（依存名の変更に対応）
+      - name: Install Playwright browsers & system deps (CLI)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "::group::Detect Playwright version"
+          PV="$(node -p \"(() => { try { return require('@playwright/test/package.json').version } catch(e) { return '' } })()\")"
+          echo "Detected @playwright/test version: ${PV:-'(not installed)'}"
+          echo "::endgroup::"
+
+          echo "::group::Install browsers & system deps"
+          if [ -n "$PV" ] && dpkg --compare-versions "$PV" ge "1.51.1"; then
+            # プロジェクトのバージョンで実行
+            npx playwright install --with-deps
+          else
+            # バージョン不足時は CLI を一時的に 1.51.1 で実行（Ubuntu 24.04 対応修正入り）
+            npx -y @playwright/test@1.51.1 playwright install --with-deps
+          fi
+          echo "::endgroup::"
+
+      # --- インストール後スナップショット ---
       - name: Debug | Post-install snapshot
         shell: bash
         run: |
@@ -154,12 +171,3 @@ jobs:
           echo "::group::Output check"
           test -f cards.csv
           wc -l cards.csv || true
-          head -n 20 cards.csv || true
-          echo "::endgroup::"
-
-      - name: Upload CSV artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: scshow-cards-csv
-          path: cards.csv
-          if-no-files-found: error
