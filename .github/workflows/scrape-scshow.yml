@@ -19,13 +19,24 @@ jobs:
       - name: Checkout self
         uses: actions/checkout@v4
 
+      # --- 重要: キャッシュ対象ディレクトリを先に作成しておく ---
+      - name: Prepare cache directories
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p "${NPM_CACHE_DIR}"
+          mkdir -p ~/.cache/ms-playwright ~/.cache/playwright
+          echo "Prepared:"
+          du -sh "${NPM_CACHE_DIR}" || true
+          du -sh ~/.cache/ms-playwright || true
+          du -sh ~/.cache/playwright || true
+
       - name: Setup Node
         id: node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
-          cache-dependency-path: package-lock.json
+        # 内蔵キャッシュはトラブル回避のため使用しない（明示cacheステップに統一）
 
       # npm のダウンロードキャッシュ（手動バスティング可能）
       - name: Cache npm download dir
@@ -33,12 +44,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.NPM_CACHE_DIR }}
-          key: npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('package-lock.json') }}-${{ env.CACHE_VERSION }}
+          key: npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('**/package-lock.json') }}-${{ env.CACHE_VERSION }}
           restore-keys: |
             npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-
             npm-${{ runner.os }}-
 
-      # Playwright ブラウザ資材のキャッシュ（容量が大きいため必要に応じて削除可）
+      # Playwright ブラウザ資材のキャッシュ
       - name: Cache Playwright browsers
         id: cache_pw
         uses: actions/cache@v4
@@ -46,7 +57,7 @@ jobs:
           path: |
             ~/.cache/ms-playwright
             ~/.cache/playwright
-          key: pw-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('package-lock.json') }}-${{ env.CACHE_VERSION }}
+          key: pw-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('**/package-lock.json') }}-${{ env.CACHE_VERSION }}
           restore-keys: |
             pw-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-
             pw-${{ runner.os }}-
@@ -57,11 +68,9 @@ jobs:
         run: |
           echo "::group::Runner/Tool versions"
           uname -a || true
-          lsb_release -a 2>/dev/null || true
-          echo "Node expected: 20.x (from setup-node)"
           which node && node -v
           which npm && npm -v
-          which npx && npx --version
+          which npx && npx --version || true
           echo "::endgroup::"
 
           echo "::group::Disk / Memory"
@@ -131,7 +140,7 @@ jobs:
         run: |
           set -euxo pipefail
           echo "::group::Package scripts"
-          cat package.json | sed -n '1,200p' || true
+          sed -n '1,200p' package.json || true
           echo "::endgroup::"
 
           echo "::group::Run npm script"
