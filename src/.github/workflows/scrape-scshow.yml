@@ -2,29 +2,151 @@ name: Scrape SCSHOW Cards to CSV
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "15 18 * * 1" # 毎週月曜 18:15(JST) 実行例。必要に応じて調整
+
+concurrency:
+  group: scrape-scshow-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CACHE_VERSION: v1
+  NPM_CACHE_DIR: ~/.npm
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout self
         uses: actions/checkout@v4
 
       - name: Setup Node
+        id: node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
+          cache-dependency-path: package-lock.json
 
+      # npm のダウンロードキャッシュ（手動バスティング可能）
+      - name: Cache npm download dir
+        id: cache_npm
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NPM_CACHE_DIR }}
+          key: npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('package-lock.json') }}-${{ env.CACHE_VERSION }}
+          restore-keys: |
+            npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-
+            npm-${{ runner.os }}-
+
+      # Playwright ブラウザ資材のキャッシュ（容量が大きいため必要に応じて削除可）
+      - name: Cache Playwright browsers
+        id: cache_pw
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            ~/.cache/playwright
+          key: pw-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('package-lock.json') }}-${{ env.CACHE_VERSION }}
+          restore-keys: |
+            pw-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-
+            pw-${{ runner.os }}-
+
+      # 主要な環境情報・キャッシュ状況の出力（デバッグ）
+      - name: Debug | System & Cache status (pre-install)
+        shell: bash
+        run: |
+          echo "::group::Runner/Tool versions"
+          uname -a || true
+          lsb_release -a 2>/dev/null || true
+          echo "Node expected: 20.x (from setup-node)"
+          which node && node -v
+          which npm && npm -v
+          which npx && npx --version
+          echo "::endgroup::"
+
+          echo "::group::Disk / Memory"
+          df -h
+          free -h || true
+          echo "::endgroup::"
+
+          echo "::group::Cache hits"
+          echo "npm cache hit: ${{ steps.cache_npm.outputs.cache-hit }}"
+          echo "playwright cache hit: ${{ steps.cache_pw.outputs.cache-hit }}"
+          echo "::endgroup::"
+
+          echo "::group::Existing cache directories (before install)"
+          echo "NPM_CACHE_DIR=${NPM_CACHE_DIR}"
+          [ -d "${NPM_CACHE_DIR}" ] && du -sh "${NPM_CACHE_DIR}" || echo "NPM cache dir not found"
+          for d in ~/.cache/ms-playwright ~/.cache/playwright; do
+            if [ -d "$d" ]; then du -sh "$d"; else echo "$d not found"; fi
+          done
+          echo "::endgroup::"
+
+      # Playwright の依存インストール（OSパッケージ等も含む）
       - name: Install Playwright Browsers
         uses: microsoft/playwright-github-action@v1
 
-      - name: Install deps
-        run: npm ci
+      - name: Install deps (npm ci)
+        env:
+          # npm の詳細ログを最大化
+          npm_config_loglevel: silly
+          NODE_OPTIONS: "--trace-deprecation"
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "::group::npm config"
+          npm config set cache "$NPM_CACHE_DIR" --global
+          npm config set prefer-offline true
+          npm config get cache
+          npm config ls -l
+          echo "::endgroup::"
+
+          echo "::group::npm ci"
+          npm ci --prefer-offline --no-audit --fund=false --verbose
+          echo "::endgroup::"
+
+      - name: Debug | Post-install snapshot
+        shell: bash
+        run: |
+          echo "::group::node_modules size & key files"
+          du -sh node_modules || true
+          test -f package-lock.json && sha256sum package-lock.json || true
+          echo "::endgroup::"
+
+          echo "::group::Cache directories (after install)"
+          [ -d "${NPM_CACHE_DIR}" ] && du -sh "${NPM_CACHE_DIR}" || echo "NPM cache dir not found"
+          for d in ~/.cache/ms-playwright ~/.cache/playwright; do
+            if [ -d "$d" ]; then du -sh "$d"; else echo "$d not found"; fi
+          done
+          echo "::endgroup::"
+
+          echo "::group::Top N largest npm cache entries"
+          if [ -d "${NPM_CACHE_DIR}" ]; then
+            (cd "${NPM_CACHE_DIR}" && du -ah . | sort -hr | head -n 50) || true
+          fi
+          echo "::endgroup::"
 
       - name: Run scraper
-        run: npm run scrape
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "::group::Package scripts"
+          cat package.json | sed -n '1,200p' || true
+          echo "::endgroup::"
+
+          echo "::group::Run npm script"
+          npm run scrape
+          echo "::endgroup::"
+
+      - name: Verify output
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Output check"
+          test -f cards.csv
+          wc -l cards.csv || true
+          head -n 20 cards.csv || true
+          echo "::endgroup::"
 
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
