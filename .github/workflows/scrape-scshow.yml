@@ -19,6 +19,7 @@ jobs:
       - name: Checkout self
         uses: actions/checkout@v4
 
+      # --- 重要: キャッシュ対象ディレクトリを先に作成（未作成エラー回避） ---
       - name: Prepare cache directories
         shell: bash
         run: |
@@ -31,7 +32,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+        # 内蔵cacheは使わず、下の actions/cache に統一
 
+      # --- ロックファイルの有無を検出 ---
       - name: Detect lockfile
         id: detect
         shell: bash
@@ -43,6 +46,7 @@ jobs:
             echo "lock_exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # --- npm ダウンロードキャッシュ（lock あり） ---
       - name: Cache npm (by package-lock.json)
         if: steps.detect.outputs.lock_exists == 'true'
         id: cache_npm_lock
@@ -54,6 +58,7 @@ jobs:
             npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-lock-
             npm-${{ runner.os }}-
 
+      # --- npm ダウンロードキャッシュ（lock なし → package.json ベース） ---
       - name: Cache npm (by package.json)
         if: steps.detect.outputs.lock_exists != 'true'
         id: cache_npm_pkg
@@ -65,6 +70,7 @@ jobs:
             npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-pkg-
             npm-${{ runner.os }}-
 
+      # --- Playwright ブラウザ資材キャッシュ ---
       - name: Cache Playwright browsers
         id: cache_pw
         uses: actions/cache@v4
@@ -77,6 +83,7 @@ jobs:
             pw-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-
             pw-${{ runner.os }}-
 
+      # --- 事前デバッグ情報 ---
       - name: Debug | System & Cache status (pre-install)
         shell: bash
         run: |
@@ -106,6 +113,7 @@ jobs:
           done
           echo "::endgroup::"
 
+      # --- 依存インストール（lock 有無で ci/install を自動選択） ---
       - name: Install deps (npm ci/install with detailed logs)
         env:
           npm_config_loglevel: silly
@@ -113,6 +121,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           echo "::group::npm config"
           npm config set cache "$NPM_CACHE_DIR" --global
           npm config set prefer-offline true
@@ -130,7 +139,7 @@ jobs:
           fi
           echo "::endgroup::"
 
-      # Playwright CLI でブラウザ＋システム依存を導入（Ubuntu 24.04対応）
+      # --- Playwright ブラウザ＋システム依存を CLI で導入（Ubuntu 24.04 対応） ---
       - name: Install Playwright browsers & system deps (CLI)
         shell: bash
         run: |
@@ -142,6 +151,7 @@ jobs:
             npx -y @playwright/test@1.51.1 playwright install --with-deps
           fi
 
+      # --- インストール後スナップショット ---
       - name: Debug | Post-install snapshot
         shell: bash
         run: |
@@ -158,43 +168,49 @@ jobs:
           done
           echo "::endgroup::"
 
-      # --- 失敗時の診断用ヘルパーをその場で作成（URLは環境に合わせて必要なら設定） ---
-      - name: Create failure diagnostic helper
+      # --- 失敗時の診断用ヘルパー（ESM: .mjs で生成） ---
+      - name: Create failure diagnostic helper (ESM)
         shell: bash
         run: |
+          set -eux
           mkdir -p tools artifacts
-          cat > tools/pw-dump-on-fail.js <<'EOF'
-          const fs = require('fs');
-          const path = require('path');
-          const { chromium } = require('playwright');
-          (async () => {
-            const url = process.env.DUMP_URL || 'about:blank';
-            const outDir = process.env.DUMP_DIR || 'artifacts';
-            fs.mkdirSync(outDir, { recursive: true });
-            const browser = await chromium.launch({ headless: true });
-            const page = await browser.newPage();
+          cat > tools/pw-dump-on-fail.mjs <<'EOF'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { chromium } from 'playwright';
+
+          const url = process.env.DUMP_URL || 'about:blank';
+          const outDir = process.env.DUMP_DIR || 'artifacts';
+
+          await fs.promises.mkdir(outDir, { recursive: true });
+
+          const browser = await chromium.launch({ headless: true });
+          const page = await browser.newPage();
+          try {
             try {
-              await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(()=>{});
-              await page.waitForTimeout(2000);
-              await page.screenshot({ path: path.join(outDir, 'fail-screenshot.png'), fullPage: true }).catch(()=>{});
-              const html = await page.content();
-              fs.writeFileSync(path.join(outDir, 'fail-page.html'), html);
-            } catch (e) {
-              fs.writeFileSync(path.join(outDir, 'dump-error.txt'), String(e.stack || e));
-            } finally {
-              await browser.close();
-            }
-          })();
+              await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            } catch {}
+            await page.waitForTimeout(2000);
+            try {
+              await page.screenshot({ path: path.join(outDir, 'fail-screenshot.png'), fullPage: true });
+            } catch {}
+            const html = await page.content();
+            await fs.promises.writeFile(path.join(outDir, 'fail-page.html'), html);
+          } catch (e) {
+            await fs.promises.writeFile(path.join(outDir, 'dump-error.txt'), String(e?.stack || e));
+          } finally {
+            await browser.close();
+          }
           EOF
 
       # --- スクレイパー実行（最大3回まで再試行） ---
       - name: Run scraper (up to 3 attempts)
         shell: bash
         env:
-          # Playwright のAPIログを詳細化（コンソールに出力）
           DEBUG: pw:api
-          # ダンプ対象URL（必要なら設定、未設定でもOK）
-          DUMP_URL: ""
+          # 失敗時ダンプ対象URL（既定で scshow を指す）
+          DUMP_URL: "https://asmape0104.github.io/scshow-calculator/"
+          DUMP_DIR: "artifacts"
         run: |
           set -euxo pipefail
           attempt=1
@@ -214,7 +230,7 @@ jobs:
 
           if [ $attempt -gt $max ]; then
             echo "All attempts failed. Capturing diagnostics..."
-            node tools/pw-dump-on-fail.js || true
+            node tools/pw-dump-on-fail.mjs || true
             exit 1
           fi
 
@@ -226,6 +242,7 @@ jobs:
           wc -l cards.csv || true
           head -n 20 cards.csv || true
 
+      # --- 失敗時も含めて npm / 診断ファイルを収集 ---
       - name: Upload npm logs (always)
         if: always()
         uses: actions/upload-artifact@v4
@@ -242,7 +259,7 @@ jobs:
           name: diagnostics
           path: |
             artifacts/**
-            tools/pw-dump-on-fail.js
+            tools/pw-dump-on-fail.mjs
           if-no-files-found: ignore
           retention-days: 7
 
