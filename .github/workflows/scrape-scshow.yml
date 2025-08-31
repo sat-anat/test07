@@ -9,7 +9,14 @@ concurrency:
 
 env:
   CACHE_VERSION: v1
+  # npm / Playwright のキャッシュ先
   NPM_CACHE_DIR: ~/.npm
+  PLAYWRIGHT_BROWSERS_PATH: ~/.cache/ms-playwright
+  PW_CACHE_DIRS: |
+    ~/.cache/ms-playwright
+    ~/.cache/playwright
+  # Node のキャッシュキーはメジャーで安定化（20系を使い続ける想定）
+  NODE_CACHE_KEY: 20
 
 jobs:
   scrape:
@@ -19,7 +26,7 @@ jobs:
       - name: Checkout self
         uses: actions/checkout@v4
 
-      # --- 重要: キャッシュ対象ディレクトリを先に作成（未作成エラー回避） ---
+      # キャッシュ対象ディレクトリを事前作成（未作成エラー回避）
       - name: Prepare cache directories
         shell: bash
         run: |
@@ -32,9 +39,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-        # 内蔵cacheは使わず、下の actions/cache に統一
+        # 内蔵cacheは使わず、明示的な actions/cache を利用
 
-      # --- ロックファイルの有無を検出 ---
+      # lockfile の有無を検出
       - name: Detect lockfile
         id: detect
         shell: bash
@@ -46,57 +53,49 @@ jobs:
             echo "lock_exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # --- npm ダウンロードキャッシュ（lock あり） ---
+      # npm キャッシュ復元（lock あり）
       - name: Cache npm (by package-lock.json)
         if: steps.detect.outputs.lock_exists == 'true'
         id: cache_npm_lock
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.NPM_CACHE_DIR }}
-          key: npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-lock-${{ hashFiles('package-lock.json') }}-${{ env.CACHE_VERSION }}
+          key: npm-${{ runner.os }}-node${{ env.NODE_CACHE_KEY }}-lock-${{ hashFiles('package-lock.json') }}-${{ env.CACHE_VERSION }}
           restore-keys: |
-            npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-lock-
+            npm-${{ runner.os }}-node${{ env.NODE_CACHE_KEY }}-lock-
             npm-${{ runner.os }}-
 
-      # --- npm ダウンロードキャッシュ（lock なし → package.json ベース） ---
+      # npm キャッシュ復元（lock なし → package.json ベース）
       - name: Cache npm (by package.json)
         if: steps.detect.outputs.lock_exists != 'true'
         id: cache_npm_pkg
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.NPM_CACHE_DIR }}
-          key: npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-pkg-${{ hashFiles('package.json') }}-${{ env.CACHE_VERSION }}
+          key: npm-${{ runner.os }}-node${{ env.NODE_CACHE_KEY }}-pkg-${{ hashFiles('package.json') }}-${{ env.CACHE_VERSION }}
           restore-keys: |
-            npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-pkg-
+            npm-${{ runner.os }}-node${{ env.NODE_CACHE_KEY }}-pkg-
             npm-${{ runner.os }}-
 
-      # --- Playwright ブラウザ資材キャッシュ ---
-      - name: Cache Playwright browsers
+      # Playwright ブラウザ資材キャッシュ復元
+      - name: Cache Playwright browsers (restore)
         id: cache_pw
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
-          path: |
-            ~/.cache/ms-playwright
-            ~/.cache/playwright
-          key: pw-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('package-lock.json', 'package.json') }}-${{ env.CACHE_VERSION }}
+          path: ${{ env.PW_CACHE_DIRS }}
+          key: pw-${{ runner.os }}-node${{ env.NODE_CACHE_KEY }}-${{ hashFiles('package-lock.json', 'package.json') }}-${{ env.CACHE_VERSION }}
           restore-keys: |
-            pw-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-
+            pw-${{ runner.os }}-node${{ env.NODE_CACHE_KEY }}-
             pw-${{ runner.os }}-
 
-      # --- 事前デバッグ情報 ---
+      # 事前デバッグ
       - name: Debug | System & Cache status (pre-install)
         shell: bash
         run: |
-          echo "::group::Runner/Tool versions"
-          uname -a || true
+          echo "::group::Tool versions"
           which node && node -v
           which npm && npm -v
           which npx && npx --version || true
-          echo "::endgroup::"
-
-          echo "::group::Disk / Memory"
-          df -h
-          free -h || true
           echo "::endgroup::"
 
           echo "::group::Cache hits"
@@ -105,15 +104,7 @@ jobs:
           echo "playwright cache  hit: ${{ steps.cache_pw.outputs.cache-hit }}"
           echo "::endgroup::"
 
-          echo "::group::Existing cache directories (before install)"
-          echo "NPM_CACHE_DIR=${NPM_CACHE_DIR}"
-          [ -d "${NPM_CACHE_DIR}" ] && du -sh "${NPM_CACHE_DIR}" || echo "NPM cache dir not found"
-          for d in ~/.cache/ms-playwright ~/.cache/playwright; do
-            if [ -d "$d" ]; then du -sh "$d"; else echo "$d not found"; fi
-          done
-          echo "::endgroup::"
-
-      # --- 依存インストール（lock 有無で ci/install を自動選択） ---
+      # 依存インストール（lock 有無で ci/install 切替）
       - name: Install deps (npm ci/install with detailed logs)
         env:
           npm_config_loglevel: silly
@@ -121,25 +112,30 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
-          echo "::group::npm config"
           npm config set cache "$NPM_CACHE_DIR" --global
           npm config set prefer-offline true
-          npm config get cache
-          npm config ls -l
-          echo "::endgroup::"
-
-          echo "::group::npm ci / install"
           if [ "${{ steps.detect.outputs.lock_exists }}" = "true" ]; then
-            echo "package-lock.json found → running npm ci"
             npm ci --prefer-offline --no-audit --fund=false --verbose
           else
-            echo "package-lock.json not found → running npm install"
             npm install --prefer-offline --no-audit --fund=false --verbose
           fi
-          echo "::endgroup::"
 
-      # --- Playwright ブラウザ＋システム依存を CLI で導入（Ubuntu 24.04 対応） ---
+      # ★ ここで「早期保存」：後段が失敗しても npm キャッシュを残す
+      - name: Save npm cache (lock)
+        if: steps.detect.outputs.lock_exists == 'true' && steps.cache_npm_lock.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.NPM_CACHE_DIR }}
+          key: npm-${{ runner.os }}-node${{ env.NODE_CACHE_KEY }}-lock-${{ hashFiles('package-lock.json') }}-${{ env.CACHE_VERSION }}
+
+      - name: Save npm cache (pkg)
+        if: steps.detect.outputs.lock_exists != 'true' && steps.cache_npm_pkg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.NPM_CACHE_DIR }}
+          key: npm-${{ runner.os }}-node${{ env.NODE_CACHE_KEY }}-pkg-${{ hashFiles('package.json') }}-${{ env.CACHE_VERSION }}
+
+      # Playwright ブラウザ＋システム依存を CLI で導入
       - name: Install Playwright browsers & system deps (CLI)
         shell: bash
         run: |
@@ -151,24 +147,15 @@ jobs:
             npx -y @playwright/test@1.51.1 playwright install --with-deps
           fi
 
-      # --- インストール後スナップショット ---
-      - name: Debug | Post-install snapshot
-        shell: bash
-        run: |
-          echo "::group::node_modules size & key files"
-          du -sh node_modules || true
-          test -f package-lock.json && sha256sum package-lock.json || true
-          sha256sum package.json || true
-          echo "::endgroup::"
+      # ★ Playwright キャッシュも早期保存（後段失敗に備える）
+      - name: Save Playwright browsers cache
+        if: steps.cache_pw.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.PW_CACHE_DIRS }}
+          key: pw-${{ runner.os }}-node${{ env.NODE_CACHE_KEY }}-${{ hashFiles('package-lock.json', 'package.json') }}-${{ env.CACHE_VERSION }}
 
-          echo "::group::Cache directories (after install)"
-          [ -d "${NPM_CACHE_DIR}" ] && du -sh "${NPM_CACHE_DIR}" || echo "NPM cache dir not found"
-          for d in ~/.cache/ms-playwright ~/.cache/playwright; do
-            if [ -d "$d" ]; then du -sh "$d"; else echo "$d not found"; fi
-          done
-          echo "::endgroup::"
-
-      # --- 失敗時の診断用ヘルパー（ESM: .mjs で生成） ---
+      # 以降：スクレイパー実行（前回の詳細デバッグ＆リトライ＆診断はそのまま）
       - name: Create failure diagnostic helper (ESM)
         shell: bash
         run: |
@@ -178,22 +165,15 @@ jobs:
           import fs from 'node:fs';
           import path from 'node:path';
           import { chromium } from 'playwright';
-
           const url = process.env.DUMP_URL || 'about:blank';
           const outDir = process.env.DUMP_DIR || 'artifacts';
-
           await fs.promises.mkdir(outDir, { recursive: true });
-
           const browser = await chromium.launch({ headless: true });
           const page = await browser.newPage();
           try {
-            try {
-              await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-            } catch {}
+            try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
             await page.waitForTimeout(2000);
-            try {
-              await page.screenshot({ path: path.join(outDir, 'fail-screenshot.png'), fullPage: true });
-            } catch {}
+            try { await page.screenshot({ path: path.join(outDir, 'fail-screenshot.png'), fullPage: true }); } catch {}
             const html = await page.content();
             await fs.promises.writeFile(path.join(outDir, 'fail-page.html'), html);
           } catch (e) {
@@ -203,12 +183,10 @@ jobs:
           }
           EOF
 
-      # --- スクレイパー実行（最大3回まで再試行） ---
       - name: Run scraper (up to 3 attempts)
         shell: bash
         env:
           DEBUG: pw:api
-          # 失敗時ダンプ対象URL（既定で scshow を指す）
           DUMP_URL: "https://asmape0104.github.io/scshow-calculator/"
           DUMP_DIR: "artifacts"
         run: |
@@ -227,7 +205,6 @@ jobs:
             attempt=$((attempt+1))
             sleep 7
           done
-
           if [ $attempt -gt $max ]; then
             echo "All attempts failed. Capturing diagnostics..."
             node tools/pw-dump-on-fail.mjs || true
@@ -242,7 +219,6 @@ jobs:
           wc -l cards.csv || true
           head -n 20 cards.csv || true
 
-      # --- 失敗時も含めて npm / 診断ファイルを収集 ---
       - name: Upload npm logs (always)
         if: always()
         uses: actions/upload-artifact@v4
