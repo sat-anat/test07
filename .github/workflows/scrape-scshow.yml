@@ -19,14 +19,13 @@ jobs:
       - name: Checkout self
         uses: actions/checkout@v4
 
-      # --- キャッシュ対象ディレクトリを先に作成（未作成エラー回避） ---
+      # --- 重要: キャッシュ対象ディレクトリを先に作成（未作成エラー回避） ---
       - name: Prepare cache directories
         shell: bash
         run: |
           set -eux
           mkdir -p "${NPM_CACHE_DIR}"
           mkdir -p ~/.cache/ms-playwright ~/.cache/playwright
-          echo "Prepared cache dirs."
 
       - name: Setup Node
         id: node
@@ -35,15 +34,40 @@ jobs:
           node-version: "20"
         # 内蔵cacheは使わず、下の actions/cache に統一
 
-      # --- npm ダウンロードキャッシュ ---
-      - name: Cache npm download dir
-        id: cache_npm
+      # --- ロックファイルの有無を検出 ---
+      - name: Detect lockfile
+        id: detect
+        shell: bash
+        run: |
+          set -e
+          if [ -f package-lock.json ]; then
+            echo "lock_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "lock_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --- npm ダウンロードキャッシュ（lock あり） ---
+      - name: Cache npm (by package-lock.json)
+        if: steps.detect.outputs.lock_exists == 'true'
+        id: cache_npm_lock
         uses: actions/cache@v4
         with:
           path: ${{ env.NPM_CACHE_DIR }}
-          key: npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('**/package-lock.json') }}-${{ env.CACHE_VERSION }}
+          key: npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-lock-${{ hashFiles('package-lock.json') }}-${{ env.CACHE_VERSION }}
           restore-keys: |
-            npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-
+            npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-lock-
+            npm-${{ runner.os }}-
+
+      # --- npm ダウンロードキャッシュ（lock なし → package.json ベース） ---
+      - name: Cache npm (by package.json)
+        if: steps.detect.outputs.lock_exists != 'true'
+        id: cache_npm_pkg
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NPM_CACHE_DIR }}
+          key: npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-pkg-${{ hashFiles('package.json') }}-${{ env.CACHE_VERSION }}
+          restore-keys: |
+            npm-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-pkg-
             npm-${{ runner.os }}-
 
       # --- Playwright ブラウザ資材キャッシュ ---
@@ -54,7 +78,7 @@ jobs:
           path: |
             ~/.cache/ms-playwright
             ~/.cache/playwright
-          key: pw-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('**/package-lock.json') }}-${{ env.CACHE_VERSION }}
+          key: pw-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('**/package-lock.json', '**/package.json') }}-${{ env.CACHE_VERSION }}
           restore-keys: |
             pw-${{ runner.os }}-node${{ steps.node.outputs.node-version }}-
             pw-${{ runner.os }}-
@@ -76,8 +100,9 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Cache hits"
-          echo "npm cache hit: ${{ steps.cache_npm.outputs['cache-hit'] }}"
-          echo "playwright cache hit: ${{ steps.cache_pw.outputs['cache-hit'] }}"
+          echo "npm cache (lock) hit: ${{ steps.cache_npm_lock.outputs['cache-hit'] }}"
+          echo "npm cache (pkg)  hit: ${{ steps.cache_npm_pkg .outputs['cache-hit'] }}"
+          echo "playwright cache  hit: ${{ steps.cache_pw.outputs['cache-hit'] }}"
           echo "::endgroup::"
 
           echo "::group::Existing cache directories (before install)"
@@ -88,14 +113,15 @@ jobs:
           done
           echo "::endgroup::"
 
-      # --- 依存インストール（ダウンロードはキャッシュ再利用） ---
-      - name: Install deps (npm ci)
+      # --- 依存インストール（lock 有無で ci/install を自動選択） ---
+      - name: Install deps (npm ci/install with detailed logs)
         env:
           npm_config_loglevel: silly
           NODE_OPTIONS: "--trace-deprecation"
         shell: bash
         run: |
           set -euxo pipefail
+
           echo "::group::npm config"
           npm config set cache "$NPM_CACHE_DIR" --global
           npm config set prefer-offline true
@@ -103,14 +129,19 @@ jobs:
           npm config ls -l
           echo "::endgroup::"
 
-          echo "::group::npm ci"
-          npm ci --prefer-offline --no-audit --fund=false --verbose
+          echo "::group::npm ci / install"
+          if [ "${{ steps.detect.outputs.lock_exists }}" = "true" ]; then
+            echo "package-lock.json found → running npm ci"
+            npm ci --prefer-offline --no-audit --fund=false --verbose
+          else
+            echo "package-lock.json not found → running npm install"
+            npm install --prefer-offline --no-audit --fund=false --verbose
+          fi
           echo "::endgroup::"
 
       # --- Playwright ブラウザ＋システム依存を CLI で導入（Ubuntu 24.04 対応） ---
-      #  - プロジェクトに入っている @playwright/test のバージョンを確認
-      #  - 1.51.1 以上ならそのまま `npx playwright install --with-deps`
-      #  - 古い場合は CLI だけ 1.51.1 を一時使用してインストール（依存名の変更に対応）
+      # 公式推奨: GitHub Actionではなく CLI を使用（`npx playwright install --with-deps`）
+      # 古い Playwright 依存のために失敗する環境では CLI を一時的に v1.51.1 にピン留め
       - name: Install Playwright browsers & system deps (CLI)
         shell: bash
         run: |
@@ -122,10 +153,8 @@ jobs:
 
           echo "::group::Install browsers & system deps"
           if [ -n "$PV" ] && dpkg --compare-versions "$PV" ge "1.51.1"; then
-            # プロジェクトのバージョンで実行
             npx playwright install --with-deps
           else
-            # バージョン不足時は CLI を一時的に 1.51.1 で実行（Ubuntu 24.04 対応修正入り）
             npx -y @playwright/test@1.51.1 playwright install --with-deps
           fi
           echo "::endgroup::"
@@ -137,6 +166,7 @@ jobs:
           echo "::group::node_modules size & key files"
           du -sh node_modules || true
           test -f package-lock.json && sha256sum package-lock.json || true
+          sha256sum package.json || true
           echo "::endgroup::"
 
           echo "::group::Cache directories (after install)"
@@ -171,3 +201,21 @@ jobs:
           echo "::group::Output check"
           test -f cards.csv
           wc -l cards.csv || true
+          head -n 20 cards.csv || true
+          echo "::endgroup::"
+
+      # --- 失敗時も含めて npm のデバッグログを収集 ---
+      - name: Upload npm logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-logs
+          path: ~/.npm/_logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scshow-cards-csv
+          path: cards.csv
